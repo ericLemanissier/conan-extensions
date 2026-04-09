@@ -40,7 +40,7 @@ def post_package(conanfile):
             pdb_file = os.path.basename(pdb_path)
             src_path = os.path.dirname(pdb_path)
             dst_path = os.path.dirname(dll_path)
-            if src_path != dst_path:  # if pdb is not allready in the package folder, then copy
+            if src_path != dst_path:  # if pdb is not already in the package folder, then copy
                 # Copy the corresponding pdb file from the build to the package folder
                 conanfile.output.info(
                     f"copying {pdb_file} from {src_path} to {dst_path}")
