@@ -58,6 +58,7 @@ def test_convert_txt():
         from conan.tools.cmake import cmake_layout
 
         class Pkg(ConanFile):
+            settings = "os", "compiler", "build_type", "arch"
             generators = "CMakeToolchain", "CMakeDeps",
             default_options = {'hello*:shared': 'True'}
 

@@ -32,6 +32,7 @@ def convert_txt(conan_api, parser, *args, **kwargs):
         {% endif %}
 
         class Pkg(ConanFile):
+            settings = "os", "compiler", "build_type", "arch"
             {% if generators %}
             generators ={% for g in generators %} "{{g}}",{% endfor %}
             {% endif %}
