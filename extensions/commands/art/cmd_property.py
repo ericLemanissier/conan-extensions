@@ -2,8 +2,11 @@ import json
 
 from conan.api.conan_api import ConanAPI
 from conan.cli.command import conan_command, conan_subcommand
-from conans.model.recipe_ref import RecipeReference
-from conans.model.package_ref import PkgReference
+try:
+    from conan.api.model import RecipeReference, PkgReference
+except:
+    from conans.model.recipe_ref import RecipeReference
+    from conans.model.package_ref import PkgReference
 from conan.errors import ConanException
 
 from utils import api_request, assert_server_or_url_user_password
@@ -37,10 +40,12 @@ def _get_path_from_ref(ref):
         recipe_ref = RecipeReference.loads(ref)
         package_ref = None
 
-    rrev_path = f"/_/{recipe_ref.revision}" if recipe_ref.revision else ""
+    user = recipe_ref.user if recipe_ref.user else "_"
+    channel = recipe_ref.channel if recipe_ref.channel else "_"
+    rrev_path = f"/{recipe_ref.revision}" if recipe_ref.revision else ""
     pkgid_path = f"/package/{package_ref.package_id}" if package_ref and package_ref.package_id else ""
     prev_path = f"/{package_ref.revision}" if package_ref and package_ref.revision else ""
-    return f"_/{recipe_ref.name}/{recipe_ref.version}{rrev_path}{pkgid_path}{prev_path}"
+    return f"{user}/{recipe_ref.name}/{recipe_ref.version}/{channel}{rrev_path}{pkgid_path}{prev_path}"
 
 
 def _add_default_arguments(subparser):
@@ -48,8 +53,9 @@ def _add_default_arguments(subparser):
     subparser.add_argument("reference", help="Conan reference.")
     subparser.add_argument("--server", help="Server name of the Artifactory to get the build info from")
     subparser.add_argument("--url", help="Artifactory url, like: https://<address>/artifactory")
-    subparser.add_argument("--user", help="user name for the repository")
-    subparser.add_argument("--password", help="password for the user name")
+    subparser.add_argument("--user", help="User name for the Artifactory repository.")
+    subparser.add_argument("--password", help="Password for the Artifactory repository.")
+    subparser.add_argument("--token", help="Token for the Artifactory server")
     subparser.add_argument("--property", action='append',
                            help='Property to add, like --property="build.name=buildname" --property="build.number=1"')
 
@@ -104,7 +110,7 @@ def property_add(conan_api: ConanAPI, parser, subparser, *args):
         artifact_properties = get_properties(path, url, user, password)
 
         for property in args.property:
-            key, val = property.split('=')[0], property.split('=')[1]
+            key, _, val = property.partition('=')
             artifact_properties.setdefault(key, []).append(val)
 
         if artifact_properties:
@@ -127,9 +133,7 @@ def property_set(conan_api: ConanAPI, parser, subparser, *args):
     if not args.property:
         raise ConanException("Please, add at least one property with the --property argument.")
 
-    # json_data = json.dumps(
-    #     {"props": {prop.split('=')[0]: prop.split('=')[1] for prop in args.property}})
-    properties = {prop.split('=')[0]: prop.split('=')[1] for prop in args.property}
+    properties = {prop.partition('=')[0]: prop.partition('=')[2] for prop in args.property}
     path = f"{args.repository}/{_get_path_from_ref(args.reference)}"
     url, user, password = get_url_user_password(args)
     recursive = "1" if args.recursive else "0"

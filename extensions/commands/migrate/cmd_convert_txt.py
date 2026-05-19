@@ -3,7 +3,13 @@ import textwrap
 from jinja2 import Template
 from conan.cli.command import conan_command
 from conan.api.output import cli_out_write
-from conans.client.loader_txt import ConanFileTextLoader
+
+# FIXME: This shouldn't be done, this is an internal Conan API and shouldn't be used
+# It is forbidden, and it can break anytime
+try:
+    from conan.internal.loader import ConanFileTextLoader
+except:
+    from conans.client.loader_txt import ConanFileTextLoader
 
 
 @conan_command(group="Extension", formatters={"text": cli_out_write})
@@ -26,6 +32,7 @@ def convert_txt(conan_api, parser, *args, **kwargs):
         {% endif %}
 
         class Pkg(ConanFile):
+            settings = "os", "compiler", "build_type", "arch"
             {% if generators %}
             generators ={% for g in generators %} "{{g}}",{% endfor %}
             {% endif %}

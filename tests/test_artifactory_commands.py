@@ -1,7 +1,12 @@
 import os
+import json
+import sys
 import tempfile
+import textwrap
 
-from tools import run
+from tools import load, run, save
+from conan.tools.scm import Version
+from conan import conan_version
 
 import pytest
 
@@ -34,20 +39,26 @@ def conan_test():
     if "extensions-prod" not in out:
         run(f'conan remote add extensions-prod {os.getenv("ART_URL")}/api/conan/extensions-prod')
 
+    if "third-party" not in out:
+        run(f'conan remote add third-party {os.getenv("ART_URL")}/api/conan/third-party')
+
     run(f'conan remote login extensions-stg "{os.getenv("CONAN_LOGIN_USERNAME_EXTENSIONS_STG")}" -p "{os.getenv("CONAN_PASSWORD_EXTENSIONS_STG")}"')
     run(f'conan remote login extensions-prod "{os.getenv("CONAN_LOGIN_USERNAME_EXTENSIONS_PROD")}" -p "{os.getenv("CONAN_PASSWORD_EXTENSIONS_PROD")}"')
+    run(f'conan remote login third-party "{os.getenv("CONAN_LOGIN_USERNAME_EXTENSIONS_PROD")}" -p "{os.getenv("CONAN_PASSWORD_EXTENSIONS_PROD")}"')
     # Install extension commands (this repo)
     repo = os.path.join(os.path.dirname(__file__), "..")
     run(f"conan config install {repo}")
 
     run("conan remove '*' -c -r extensions-stg")
     run("conan remove '*' -c -r extensions-prod")
+    run("conan remove '*' -c -r third-party")
 
     try:
         yield
     finally:
         run("conan remove '*' -c -r extensions-stg")
         run("conan remove '*' -c -r extensions-prod")
+        run("conan remove '*' -c -r third-party")
         os.chdir(cwd)
         os.environ.clear()
         os.environ.update(old_env)
@@ -65,7 +76,7 @@ def test_build_info_create_no_deps():
     # Generate recipe to work with
     run("conan new cmake_lib -d name=mypkg -d version=1.0 --force")
 
-    # Create release pacakges & build info and upload them
+    # Create release packages & build info and upload them
     run("conan create . --format json -tf='' -s build_type=Release > create_release.json")
     run("conan upload mypkg/1.0 -c -r extensions-stg")
     run(f'conan art:build-info create create_release.json {build_name}_release {build_number} extensions-stg > {build_name}_release.json')
@@ -118,6 +129,68 @@ def test_build_info_create_no_deps():
 
 
 @pytest.mark.requires_credentials
+def test_build_info_export_pkg():
+
+    # Configure Artifactory server and credentials
+    run(f'conan art:server add artifactory {os.getenv("ART_URL")} --user="{os.getenv("CONAN_LOGIN_USERNAME_EXTENSIONS_STG")}" --password="{os.getenv("CONAN_PASSWORD_EXTENSIONS_STG")}"')
+    
+    # Generate recipe to work with
+    run("conan new cmake_lib -d name=mypkg -d version=1.0 --force")
+
+    run("conan build .")
+
+    # Create release packages & build info and upload them
+    run("conan export-pkg . --format json -tf='' > export.json")
+    run("conan upload mypkg/1.0 -c -r extensions-stg")
+    run(f'conan art:build-info create export.json mybuildinfo 1 extensions-stg --server=artifactory --out-file=mybuildinfo.json')
+
+    build_info = json.loads(load("mybuildinfo.json"))
+
+    mypkg_modules = [m for m in build_info["modules"] if "mypkg/1.0#294e801a0e1da10084441487e95b80e8" in m.get("id")]
+    assert len(mypkg_modules) == 2  # Assert both recipe and package modules exist
+    mypkg_recipe_module = next(m for m in mypkg_modules if m.get("id") == "mypkg/1.0#294e801a0e1da10084441487e95b80e8")
+    assert len(mypkg_recipe_module["artifacts"]) == 3  # Assert the 3 artifacts exist
+    mypkg_conanmanifest_data = next(
+        artifact for artifact in mypkg_recipe_module["artifacts"]
+        if artifact.get("name") == "conanmanifest.txt"
+    )  # Assert conanmanifest.txt path
+    assert mypkg_conanmanifest_data[
+               "path"] == "extensions-stg/_/mypkg/1.0/_/294e801a0e1da10084441487e95b80e8/export/conanmanifest.txt"
+    mypkg_sources_data = next(
+        artifact for artifact in mypkg_recipe_module["artifacts"]
+        if artifact.get("name") == "conan_sources.tgz"
+    )  # Assert conan_sources.tgz path
+    assert mypkg_sources_data[
+               "path"] == "extensions-stg/_/mypkg/1.0/_/294e801a0e1da10084441487e95b80e8/export/conan_sources.tgz"
+    mypkg_conanfile_data = next(
+        artifact for artifact in mypkg_recipe_module["artifacts"]
+        if artifact.get("name") == "conanfile.py"
+    )  # Assert conanfile.py path
+    assert mypkg_conanfile_data[
+               "path"] == "extensions-stg/_/mypkg/1.0/_/294e801a0e1da10084441487e95b80e8/export/conanfile.py"
+
+
+@pytest.mark.requires_credentials
+def test_build_info_create_with_build_url():
+
+    build_name = "mybuildinfo"
+    build_number = "1"
+    build_url = "https://foo.org"
+
+    # Configure Artifactory server and credentials
+    run(f'conan art:server add artifactory {os.getenv("ART_URL")} --user="{os.getenv("CONAN_LOGIN_USERNAME_EXTENSIONS_STG")}" --password="{os.getenv("CONAN_PASSWORD_EXTENSIONS_STG")}"')
+    
+    # Generate recipe to work with
+    run("conan new cmake_lib -d name=mypkg -d version=1.0 --force")
+
+    # Create release packages & build info and upload them
+    run("conan create . --format json -tf='' -s build_type=Release > create_release.json")
+    run("conan upload mypkg/1.0 -c -r extensions-stg")
+    out = run(f'conan art:build-info create create_release.json {build_name}_release {build_number} --build-url={build_url} extensions-stg')
+    assert build_url in out
+
+
+@pytest.mark.requires_credentials
 def test_build_info_create_deps():
     #         +-------+
     #         | libc  |
@@ -165,15 +238,17 @@ def test_build_info_create_deps():
     run("conan create . --format json -tf='' -s build_type=Release --build=missing > create_release.json")
     run("conan upload 'mypkg/1.0' -c -r extensions-stg")
     run(f'conan art:build-info create create_release.json {build_name}_release {build_number} extensions-stg --server artifactory --with-dependencies > {build_name}_release.json')
-    run(f'conan art:build-info upload {build_name}_release.json --server artifactory')
-    
+    out = run(f'conan art:build-info upload {build_name}_release.json --server artifactory')
+    assert "Build info uploaded successfully." in out
+
     run("conan create . --format json -tf='' -s build_type=Debug --build=missing > create_debug.json")
     run("conan upload 'mypkg/1.0' -c -r extensions-stg")
     run(f'conan art:build-info create create_debug.json {build_name}_debug {build_number} extensions-stg --url={os.getenv("ART_URL")} --user="{os.getenv("CONAN_LOGIN_USERNAME_EXTENSIONS_STG")}" --password="{os.getenv("CONAN_PASSWORD_EXTENSIONS_STG")}" --with-dependencies > {build_name}_debug.json')
-    run(f'conan art:build-info upload {build_name}_debug.json --url="{os.getenv("ART_URL")}" --user="{os.getenv("CONAN_LOGIN_USERNAME_EXTENSIONS_STG")}" --password="{os.getenv("CONAN_PASSWORD_EXTENSIONS_STG")}"')
+    out = run(f'conan art:build-info upload {build_name}_debug.json --server artifactory')
+    assert "Build info uploaded successfully." in out
 
-    # Aggregate build infos and upload the new one
-    run(f'conan art:build-info append {build_name}_aggregated {build_number} --server artifactory --build-info={build_name}_release,{build_number} --build-info={build_name}_debug,{build_number} > {build_name}_aggregated.json')
+    # Aggregate build infos (one from remote, one from local file) and upload the new one
+    run(f'conan art:build-info append {build_name}_aggregated {build_number} --server artifactory --build-info={build_name}_release,{build_number} --build-info-file={build_name}_debug.json > {build_name}_aggregated.json')
     run(f'conan art:build-info upload {build_name}_aggregated.json --url="{os.getenv("ART_URL")}" --user="{os.getenv("CONAN_LOGIN_USERNAME_EXTENSIONS_STG")}" --password="{os.getenv("CONAN_PASSWORD_EXTENSIONS_STG")}"')
 
     # Check all build infos exist
@@ -200,13 +275,47 @@ def test_build_info_create_deps():
 
     # run(f'conan install --requires=mypkg/1.0')
 
-    # Promotions using Release Bundles do work with depdendencies, but they are not implemented in the testing Artifactory
-    # conan art:build-info create-bundle ${build_name}_aggregated.json develop full_bundle 1.0 ${ART_URL} test_key_pair --user=${CONAN_LOGIN_USERNAME_DEVELOP} --password="${CONAN_PASSWORD_DEVELOP}"
+    run(f'conan art:build-info bundle-create full_bundle 1.0 --server="artifactory" test_key_pair --build-info={build_name}_release,{build_number} --build-info={build_name}_debug,{build_number}')
+    run(f'conan art:build-info bundle-delete full_bundle 1.0 --server="artifactory"')
 
     # Remove build-infos to clean artifactory
     run(f'conan art:build-info delete {build_name}_release --build-number={build_number} --server="artifactory" --delete-all --delete-artifacts')
     run(f'conan art:build-info delete {build_name}_debug --build-number={build_number} --url="{os.getenv("ART_URL")}" --user="{os.getenv("CONAN_LOGIN_USERNAME_EXTENSIONS_STG")}" --password="{os.getenv("CONAN_PASSWORD_EXTENSIONS_STG")}" --delete-all --delete-artifacts')
     run(f'conan art:build-info delete {build_name}_aggregated --build-number={build_number} --url="{os.getenv("ART_URL")}" --user="{os.getenv("CONAN_LOGIN_USERNAME_EXTENSIONS_STG")}" --password="{os.getenv("CONAN_PASSWORD_EXTENSIONS_STG")}" --delete-all --delete-artifacts')
+
+
+@pytest.mark.requires_credentials
+def test_build_info_create_from_cached_deps():
+    # Make sure artifactory repos are empty before starting the test
+    run("conan remove mypkg* -c -r extensions-stg")
+    run("conan remove mypkg* -c -r extensions-prod")
+
+    run(f'conan art:server add artifactory {os.getenv("ART_URL")} --user="{os.getenv("CONAN_LOGIN_USERNAME_EXTENSIONS_STG")}" --password="{os.getenv("CONAN_PASSWORD_EXTENSIONS_STG")}"')
+
+    # Create dependency packages and upload them
+    run("conan new cmake_lib -d name=libc -d version=1.0 --force")
+    run("conan create . -tf=''")
+    run("conan new cmake_lib -d name=liba -d version=1.0 -d requires=libc/1.0 --force")
+    run("conan create . -tf=''")
+
+    run("conan upload '*' --dry-run -c -r extensions-stg")
+
+    # libc node in graph is cached
+    run("conan install . --format json > install_release.json")
+
+    run(f'conan art:build-info create install_release.json bi_release 1 extensions-stg --server artifactory --with-dependencies > bi_release.json')
+
+    with open("bi_release.json", "r") as file:
+        build_info = json.load(file)
+
+    assert len(build_info.get("modules")) == 0
+
+    run(f'conan art:build-info create install_release.json bi_release 1 extensions-stg --server artifactory --with-dependencies --add-cached-deps > bi_release.json')
+
+    with open("bi_release.json", "r") as file:
+        build_info = json.load(file)
+
+    assert len(build_info.get("modules")) == 2
 
 
 @pytest.mark.requires_credentials
@@ -229,7 +338,8 @@ def test_fail_if_not_uploaded():
     run("conan create . -tf='' -s build_type=Release")
 
 
-@pytest.mark.requires_credentials
+#@pytest.mark.requires_credentials
+@pytest.mark.xfail(reason="Token not configured in CI yet")
 def test_build_info_project():
     """
     Test that build info is correctly manages using a project in Artifactory
@@ -269,6 +379,39 @@ def test_build_info_project():
 
     run(f'conan art:build-info delete {build_name} --build-number={build_number} --server artifactory --project {project}')
     run(f'conan art:build-info delete {build_name}_aggregated --delete-all --delete-artifacts --server artifactory --project {project}')
+
+
+@pytest.mark.requires_credentials
+def test_build_info_promote_continue_on_error():
+    # Make sure artifactory repos are empty before starting the test
+    run("conan remove mypkg* -c -r extensions-stg")
+    run("conan remove mypkg* -c -r extensions-prod")
+
+    # Configure Artifactory server and credentials
+    run(f'conan art:server add artifactory {os.getenv("ART_URL")} --user="{os.getenv("CONAN_LOGIN_USERNAME_EXTENSIONS_STG")}" --password="{os.getenv("CONAN_PASSWORD_EXTENSIONS_STG")}"')
+
+    build_name = "otherbuildinfopromote"
+    build_number = "1"
+    project = "extensions-testing"
+
+    run("conan new cmake_lib -d name=mypkg -d version=1.0 --force")
+    run("conan create . --format json -tf='' > create.json")
+    run("conan upload 'mypkg/1.0' -c -r extensions-stg")
+
+    run(f'conan art:build-info create create.json {build_name} {build_number} extensions-stg --server artifactory > {build_name}.json')
+    run(f'conan art:build-info upload {build_name}.json --server artifactory')
+    # Remove package (not recipe) to force promotion fail
+    run("conan remove 'mypkg/1.0:*' -c -r extensions-stg")
+    out = run(f'conan art:build-info promote {build_name} {build_number} extensions-stg extensions-prod --server artifactory', error=True)
+    assert "ERROR: 400: Unable to find artifacts of build 'otherbuildinfopromote' #1 from artifactory-build-info repo: aborting promotion." in out
+    out = run(f'conan art:build-info promote {build_name} {build_number} extensions-stg extensions-prod --server artifactory --continue-on-error')
+    assert "Handling copy/move of file: extensions-prod/_/mypkg/1.0/_/294e801a0e1da10084441487e95b80e8/export/conanfile.py" in out
+
+    run('conan remove mypkg* -c')
+    run('conan remove mypkg* -c -r extensions-stg')
+    run('conan remove mypkg* -c -r extensions-prod')
+
+    run(f'conan art:build-info delete {build_name} --delete-all --delete-artifacts --server artifactory')
 
 
 @pytest.mark.requires_credentials
@@ -322,6 +465,72 @@ def test_build_info_dependency_different_repo():
     run('conan remove liba* -c -r extensions-prod')
 
     run(f'conan art:build-info delete {build_name} --build-number={build_number} --server artifactory')
+
+@pytest.mark.requires_credentials
+def test_build_info_dependency_from_extra_repo():
+    """
+    Tests that the build-info correctly attributes a dependency's path
+    to the repository it was found in.
+    """
+    #         +-------+
+    #         | dep   | (from third-party repo)
+    #         +-------+
+    #             |
+    #          +--+--+
+    #          | pkg | (from extensions-stg repo)
+    #          +-----+
+
+
+    # Make sure artifactory repos are empty before starting the test
+    run("conan remove mypkg* -c -r extensions-stg")
+    run("conan remove mypkg* -c -r third-party")
+
+    # Configure Artifactory server and credentials
+    run(f'conan art:server add artifactory {os.getenv("ART_URL")} --user="{os.getenv("CONAN_LOGIN_USERNAME_EXTENSIONS_STG")}" --password="{os.getenv("CONAN_PASSWORD_EXTENSIONS_STG")}"')
+
+    # Create dependency and upload it to the 'third-party' repo
+    run("conan new cmake_lib -d name=dep -d version=1.0 --force")
+    run("conan create .")
+    run("conan upload dep/1.0 -c -r third-party")
+    run("conan remove dep/1.0 -c")  # Ensure it's not in the local cache
+
+    # Create consumer package that requires the dependency
+    run("conan new cmake_lib -d name=pkg -d version=1.0 -d requires=dep/1.0 --force")
+    # Create the package, it will download 'dep' from 'third-party'
+    run("conan create . --format=json > create.json")
+    run("conan upload pkg/1.0 -c -r extensions-stg")
+
+    # Create the build-info, specifying the extra repository
+    build_name = "build_with_extra_repo"
+    build_number = "1"
+    run(f'conan art:build-info create create.json {build_name} {build_number} extensions-stg third-party '
+        f'--with-dependencies --add-cached-deps '
+        f'--server=artifactory > {build_name}.json')
+
+    # Verify the generated build-info
+    with open(f"{build_name}.json", "r") as f:
+        build_info = json.load(f)
+
+    modules = build_info.get("modules", [])
+    
+    # Find the module for the dependency 'dep/1.0'
+    dep_module = None
+    for module in modules:
+        if module.get("id", "").startswith("dep/1.0"):
+            dep_module = module
+            break
+
+    assert dep_module is not None, "Dependency 'dep/1.0' not found in build-info modules"
+
+    # Check that the path of its artifacts points to the 'third-party' repo
+    for artifact in dep_module.get("artifacts", []):
+        path = artifact.get("path", "")
+        assert path.startswith("third-party/"), \
+            f"Artifact path '{path}' should start with 'third-party/'"
+
+    # Clean up
+    run(f"conan remove '*' -c -r third-party")
+    run(f"conan remove '*' -c -r extensions-stg")
 
 
 @pytest.mark.requires_credentials
@@ -394,3 +603,242 @@ def test_server_list_empty():
     out = run("conan art:server list")
 
     assert "No servers configured. Use `conan art:server add` command to add one." in out
+
+
+#@pytest.mark.requires_credentials
+@pytest.mark.xfail(reason="Token not configured in CI yet")
+def test_add_server_token():
+    """
+    Test server add with token
+    """
+
+    # Make sure artifactory repos are empty before starting the test
+    run("conan remove mypkg* -c -r extensions-stg")
+    run("conan remove mypkg* -c -r extensions-prod")
+
+    server_url = os.getenv("ART_URL")
+    server_user = os.getenv("CONAN_LOGIN_USERNAME_EXTENSIONS_STG")
+    token = os.getenv("ARTIFACTORY_TOKEN")
+
+    out_add = run(f'conan art:server add server1 {server_url} --user="{server_user}" --token="{token}"')
+
+    assert f"Server 'server1' ({server_url}) added successfully" in out_add
+
+
+class TestArtPromoteCommand:
+    @pytest.mark.requires_credentials
+    def test_art_promote_timestamps(self):
+        conanfile = textwrap.dedent("""
+        from conan import ConanFile
+    
+        class Pkg(ConanFile):
+            name = "mypkg"
+            version = "1.0"
+        """)
+        save("./conanfile.py", conanfile)
+
+        run("conan create .")
+        out = run("conan list mypkg/1.0:*#* -f=json")
+        local_list_json_out = json.loads(out)
+        local_recipe_timestamp = local_list_json_out["Local Cache"]["mypkg/1.0"]["revisions"]["9d6b6bdeb9bb50a31acc8f970f562b3c"]["timestamp"]
+        local_package_timestamp = local_list_json_out["Local Cache"]["mypkg/1.0"]["revisions"]["9d6b6bdeb9bb50a31acc8f970f562b3c"]["packages"]["da39a3ee5e6b4b0d3255bfef95601890afd80709"]["revisions"]["0ba8627bd47edc3a501e8f0eb9a79e5e"]["timestamp"]
+        run("conan upload mypkg/1.0 -c -r extensions-stg")
+
+        out = run("conan list mypkg/1.0:*#* -r=extensions-stg -f=json", stderr=None)
+        remote_stg_list_json_out = json.loads(out)
+        remote_stg_recipe_timestamp = remote_stg_list_json_out["extensions-stg"]["mypkg/1.0"]["revisions"]["9d6b6bdeb9bb50a31acc8f970f562b3c"]["timestamp"]
+        remote_stg_package_timestamp = remote_stg_list_json_out["extensions-stg"]["mypkg/1.0"]["revisions"]["9d6b6bdeb9bb50a31acc8f970f562b3c"]["packages"]["da39a3ee5e6b4b0d3255bfef95601890afd80709"]["revisions"]["0ba8627bd47edc3a501e8f0eb9a79e5e"]["timestamp"]
+
+        assert local_recipe_timestamp != remote_stg_recipe_timestamp
+        assert local_package_timestamp != remote_stg_package_timestamp
+
+        save("pkglist.json", out)
+
+        art_url = os.getenv("ART_URL")
+        art_user = os.getenv("CONAN_LOGIN_USERNAME_EXTENSIONS_PROD")
+        art_password = os.getenv("CONAN_PASSWORD_EXTENSIONS_PROD")
+        run(f"conan art:promote pkglist.json --from=extensions-stg --to=extensions-prod --url={art_url} --user={art_user} --password={art_password}")
+
+        out = run("conan list mypkg/1.0:*#* -r=extensions-prod -f=json", stderr=None)
+        remote_prod_list_json_out = json.loads(out)
+        remote_prod_recipe_timestamp = remote_prod_list_json_out["extensions-prod"]["mypkg/1.0"]["revisions"]["9d6b6bdeb9bb50a31acc8f970f562b3c"]["timestamp"]
+        remote_prod_package_timestamp = remote_prod_list_json_out["extensions-prod"]["mypkg/1.0"]["revisions"]["9d6b6bdeb9bb50a31acc8f970f562b3c"]["packages"]["da39a3ee5e6b4b0d3255bfef95601890afd80709"]["revisions"]["0ba8627bd47edc3a501e8f0eb9a79e5e"]["timestamp"]
+
+        assert remote_stg_recipe_timestamp == remote_prod_recipe_timestamp
+        assert remote_stg_package_timestamp == remote_prod_package_timestamp
+
+    @pytest.mark.requires_credentials
+    def test_art_promote_build_version(self):
+        conanfile = textwrap.dedent("""
+            from conan import ConanFile
+    
+            class Pkg(ConanFile):
+                name = "mypkg"
+                version = "1.0+build"
+            """)
+        save("./conanfile.py", conanfile)
+
+        run("conan create .")
+        run("conan upload mypkg/1.0+build --format json --out-file pkglist.json -c -r extensions-stg")
+
+        # promote package extensions-stg => extensions-prod
+        art_url = os.getenv("ART_URL")
+        art_user = os.getenv("CONAN_LOGIN_USERNAME_EXTENSIONS_PROD")
+        art_password = os.getenv("CONAN_PASSWORD_EXTENSIONS_PROD")
+        run(f"conan art:promote pkglist.json --from=extensions-stg --to=extensions-prod --url={art_url} --user={art_user} --password={art_password}")
+
+        # check that package is available in extensions-prod
+        out = run("conan list mypkg/1.0+build:*#* -r=extensions-prod -f=json", stderr=None)
+        remote_prod_list_json = json.loads(out)
+        assert "extensions-prod" in remote_prod_list_json
+        assert "mypkg/1.0+build" in remote_prod_list_json["extensions-prod"]
+
+    @pytest.mark.requires_credentials
+    def test_art_promote_python_requires(self):
+        conanfile = textwrap.dedent("""
+            from conan import ConanFile
+
+            class Pkg(ConanFile):
+                name = "mypkg"
+                version = "1.0"
+                package_type = "python-require"
+            """)
+        save("./conanfile.py", conanfile)
+
+        run("conan create .")
+        run("conan upload mypkg/1.0 -c -r extensions-stg")
+
+        run("conan list mypkg/1.0:*#* -r=extensions-stg -f=json --out-file=pkglist.json")
+
+        art_url = os.getenv("ART_URL")
+        art_user = os.getenv("CONAN_LOGIN_USERNAME_EXTENSIONS_PROD")
+        art_password = os.getenv("CONAN_PASSWORD_EXTENSIONS_PROD")
+        run(f"conan art:promote pkglist.json --from=extensions-stg --to=extensions-prod "
+            f"--url={art_url} --user={art_user} --password={art_password}")
+
+        out = run("conan list mypkg/1.0:*#* -r=extensions-prod -f=json", stderr=None)
+        assert "mypkg/1.0" in out
+
+    @pytest.mark.requires_credentials
+    @pytest.mark.parametrize("compress", [None, "gz", "zst", "xz"])
+    def test_art_promote_different_compressions(self, compress):
+        if compress == "zst" and sys.version_info.minor < 14:
+            pytest.skip("Skipping zst compression tests")
+
+        conf = f"-cc core.upload:compression_format={compress}" if compress else ""
+        conanfile = textwrap.dedent("""
+                from conan import ConanFile
+
+                class Pkg(ConanFile):
+                    name = "mypkg"
+                    version = "1.0"
+                """)
+        save("./conanfile.py", conanfile)
+
+        run(f"conan create . {conf}")
+        run(f"conan upload mypkg/1.0 -c -r extensions-stg {conf} -vvv")
+        run(f'conan remove "*" -c {conf}')
+
+        run(f"conan list mypkg/1.0:*#* -r=extensions-stg -f=json --out-file=pkglist.json {conf}")
+
+        art_url = os.getenv("ART_URL")
+        art_user = os.getenv("CONAN_LOGIN_USERNAME_EXTENSIONS_PROD")
+        art_password = os.getenv("CONAN_PASSWORD_EXTENSIONS_PROD")
+        run(f"conan art:promote pkglist.json --from=extensions-stg --to=extensions-prod "
+            f"--url={art_url} --user={art_user} --password={art_password}")
+
+        out = run(f"conan list mypkg/1.0:*#* -r=extensions-prod -f=json {conf}", stderr=None)
+        assert "da39a3ee5e6b4b0d3255bfef95601890afd80709" in out
+        run(f"conan download mypkg/1.0:*#* -r=extensions-prod {conf} -vvv")
+
+        # And lastly, just in case
+        run(f"conan cache check-integrity mypkg/1.0:*#* {conf}")
+
+
+@pytest.mark.requires_credentials
+def test_property_value_with_equals_sign():
+    """
+    Test that property values containing '=' are correctly parsed and set in Artifactory.
+    Regression test for https://github.com/conan-io/conan-extensions/issues/228
+    """
+    # Configure Artifactory server (credentials stored securely, not printed in logs)
+    run(f'conan art:server add artifactory {os.getenv("ART_URL")} '
+        f'--user="{os.getenv("CONAN_LOGIN_USERNAME_EXTENSIONS_STG")}" '
+        f'--password="{os.getenv("CONAN_PASSWORD_EXTENSIONS_STG")}"')
+
+    # Create and upload a package
+    run("conan new cmake_lib -d name=mypkg -d version=1.0 --force")
+    run("conan create . -tf=''")
+    run("conan upload mypkg/1.0 -c -r extensions-stg")
+
+    # Set a property with '=' in the value (the bug would truncate the value)
+    url_with_equals = "https://my.domain/build?id=12345"
+    run(f'conan art:property set extensions-stg mypkg/1.0 '
+        f'--property="build.url={url_with_equals}" '
+        f'--server=artifactory')
+
+    # Verify the property was set correctly by querying Artifactory API
+    import urllib.request
+    import base64
+
+    art_url = os.getenv("ART_URL")
+    art_user = os.getenv("CONAN_LOGIN_USERNAME_EXTENSIONS_STG")
+    art_password = os.getenv("CONAN_PASSWORD_EXTENSIONS_STG")
+
+    credentials = base64.b64encode(f"{art_user}:{art_password}".encode()).decode()
+    request = urllib.request.Request(
+        f"{art_url}/api/storage/extensions-stg/_/mypkg/1.0/_?properties",
+        headers={"Authorization": f"Basic {credentials}"}
+    )
+    response = urllib.request.urlopen(request)
+    properties = json.loads(response.read().decode()).get("properties", {})
+
+    # Check that the full URL with '=' is preserved
+    assert "build.url" in properties, "Property 'build.url' not found"
+    actual_value = properties["build.url"][0]
+    assert actual_value == url_with_equals, \
+        f"Property value was truncated! Expected '{url_with_equals}', got '{actual_value}'"
+
+
+@pytest.mark.requires_credentials
+def test_append_local_build_info():
+    """
+    Test that we can append local build infos (without uploding them previously to artifactory)
+    """
+    build_name = "my_build"
+    build_number = "1"
+
+    run("conan new cmake_lib -d name=mypkg -d version=1.0 --force")
+
+    # Create release packages & build info
+    run("conan create . --format json -s build_type=Release > create_release.json")
+    run("conan upload mypkg/1.0 -c -r extensions-stg")
+    run(f"conan art:build-info create create_release.json {build_name}_release {build_number} extensions-stg > {build_name}_release.json")
+    bi_data = json.loads(load(f"{build_name}_release.json"))
+    assert len(bi_data["modules"]) == 2
+
+    # Create debug packages & build info
+    run("conan create . --format json -s build_type=Debug > create_debug.json")
+    run("conan upload mypkg/1.0 -c -r extensions-stg")
+    run(f"conan art:build-info create create_debug.json {build_name}_debug {build_number} extensions-stg > {build_name}_debug.json")
+    bi_data = json.loads(load(f"{build_name}_debug.json"))
+    assert len(bi_data["modules"]) == 2
+
+    # Aggregate the release and debug build infos into a new one
+    output = run(f"conan art:build-info append {build_name} {build_number} --build-info-file={build_name}_release.json "
+                 f"--build-info-file={build_name}_debug.json")
+    bi_data = json.loads(output)
+
+    assert bi_data["name"] == build_name
+    assert bi_data["number"] == build_number
+    assert len(bi_data["modules"]) == 3
+
+    assert bi_data["modules"][0]["id"] == "mypkg/1.0#294e801a0e1da10084441487e95b80e8"
+    recipe_files = {artifact["name"] for artifact in bi_data["modules"][0]["artifacts"]}
+    assert set(recipe_files) == {"conanfile.py", "conan_sources.tgz", "conanmanifest.txt"}
+
+    for n in [1, 2]:
+        # omit pkgid for multi-platform testing
+        assert "mypkg/1.0#294e801a0e1da10084441487e95b80e8:" in bi_data["modules"][n]["id"]
+        package_files = {artifact["name"] for artifact in bi_data["modules"][n]["artifacts"]}
+        assert set(package_files) == {"conanmanifest.txt", "conaninfo.txt", "conan_package.tgz"}
